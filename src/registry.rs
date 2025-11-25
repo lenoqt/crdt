@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use zenoh::Session;
 
 use crate::actor::{Document, DocumentContext, DocumentTag};
-use crate::types::{CrdtError, NetworkStats, PresenceMessage, RobotId, RobotPosition};
+use crate::types::{CrdtError, PresenceMessage, RobotId, RobotPosition};
 use kameo::actor::{ActorRef, Spawn};
 
 const DISCOVERY_TOPIC: &str = "crdt/discovery";
@@ -22,17 +22,12 @@ pub struct RegisteredActorRef {
 pub struct DocumentRegistry {
     doc_actor_refs: Arc<RwLock<HashMap<Cow<'static, str>, RegisteredActorRef>>>,
     session: Session,
-    stats: NetworkStats, 
     owned_id: RobotId,
 }
 
 impl DocumentRegistry {
     pub fn builder() -> DocumentRegistryBuilder {
         DocumentRegistryBuilder::default()
-    }
-    
-    pub fn get_stats(&self) -> NetworkStats {
-        self.stats.clone()
     }
 
     pub async fn add_remote(
@@ -63,7 +58,6 @@ impl DocumentRegistry {
             robot_id: id,
             origin: DocumentTag::Remote(yrs::Origin::from(id.to_string())),
             initial_state: Some(RobotPosition::new(id.0, 0.0, 0.0)),
-            stats: self.stats.clone(),
         };
         let remote_actor = Document::<RobotPosition>::spawn(remote_ctx);
 
@@ -135,13 +129,11 @@ impl DocumentRegistryBuilder {
         let owned_id = self
             .id
             .ok_or_else(|| CrdtError::Other("RobotId is required".to_string()))?;
-        let stats = NetworkStats::new();
 
         let registry = DocumentRegistry {
             doc_actor_refs: Arc::new(RwLock::new(HashMap::new())),
             session: session.clone(),
             owned_id,
-            stats: stats.clone(),
         };
 
         // Create owned actor
@@ -150,7 +142,6 @@ impl DocumentRegistryBuilder {
             robot_id: owned_id,
             origin: DocumentTag::Owned(yrs::Origin::from(owned_id.to_string())),
             initial_state: Some(RobotPosition::new(owned_id.0, 0.0, 0.0)),
-            stats: stats.clone(),
         };
         let owned_actor = Document::<RobotPosition>::spawn(owned_ctx);
 
