@@ -3,14 +3,16 @@ use kameo::{Actor, Reply};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
+use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::task::spawn;
 use yrs::{
-    Array, Doc, ReadTxn, StateVector, Subscription, Transact, Update, WriteTxn,
+    Array, Doc, Map, ReadTxn, StateVector, Subscription, Transact, Update, WriteTxn,
     updates::decoder::Decode,
 };
 use zenoh::Session;
 
-use crate::types::{CrdtError, RobotId};
+use crate::types::{CrdtError, NetworkStats, RobotId};
 
 #[derive(Clone)]
 pub enum DocumentTag {
@@ -32,7 +34,9 @@ pub struct Document<T: Serialize + DeserializeOwned + Default + Send + Clone + '
     tag: DocumentTag,
     _subscription: Subscription,
     fallback_state: Option<T>,
+    _stats: NetworkStats,
     _marker: PhantomData<T>,
+    _last_sync_state: Arc<Mutex<StateVector>>,
 }
 
 impl<T> Document<T>
@@ -42,25 +46,18 @@ where
     fn set(&self, value: &T, origin: &yrs::Origin) -> Result<(), CrdtError> {
         let bytes = serde_json::to_vec(value)?;
         let mut txn = self.doc.transact_mut_with(origin.clone());
-        let array = txn.get_or_insert_array("state");
-
-        let len = array.len(&txn);
-        if len > 0 {
-            array.remove_range(&mut txn, 0, len);
-        }
-        array.push_back(&mut txn, bytes);
+        let map = txn.get_or_insert_map("state");
+        map.insert(&mut txn, "value", bytes);  // Single operation - replaces old value
         Ok(())
     }
 
+
+
     fn get(&self) -> T {
         let txn = self.doc.transact();
-        if let Some(array) = txn.get_array("state") {
-            if array.len(&txn) > 0 {
-                if let Some(value) = array.get(&txn, 0) {
-                    if let yrs::Out::Any(yrs::Any::Buffer(bytes)) = value {
-                        return serde_json::from_slice(&bytes).unwrap_or_default();
-                    }
-                }
+        if let Some(map) = txn.get_map("state") {
+            if let Some(yrs::Out::Any(yrs::Any::Buffer(bytes))) = map.get(&txn, "value") {
+                return serde_json::from_slice(&bytes).unwrap_or_default();
             }
         }
         self.fallback_state.clone().unwrap_or_default()
@@ -135,6 +132,7 @@ pub struct DocumentContext<T> {
     pub session: Session,
     pub robot_id: RobotId,
     pub origin: DocumentTag,
+    pub stats: NetworkStats, 
     pub initial_state: Option<T>,
 }
 
@@ -153,12 +151,18 @@ where
         let topic = format!("{}/position/sync", args.robot_id);
         let topic_for_sub = topic.clone();
         let session_clone = args.session.clone();
+        let stats_clone = args.stats.clone();
+        let last_sync = Arc::new(Mutex::new(StateVector::default()));
+        let last_sync_clone = last_sync.clone();    
 
         let is_owned = matches!(args.origin, DocumentTag::Owned(_));
         let subscription = doc
             .observe_update_v1(move |txn, _update_event| {
                 if is_owned && txn.origin().is_some() {
-                    let update = txn.encode_state_as_update_v1(&StateVector::default());
+                    let last_sv = last_sync_clone.lock().unwrap().clone();
+                    let update = txn.encode_state_as_update_v1(&last_sv);
+                    *last_sync_clone.lock().unwrap() = txn.state_vector();     
+                    stats_clone.record_sent(update.len());
                     let topic = topic.clone();
                     let session = session_clone.clone();
                     spawn(async move {
@@ -172,6 +176,7 @@ where
 
         if let DocumentTag::Remote(_) = args.origin {
             let session_sub = args.session.clone();
+            let stats_sub = args.stats.clone();
             spawn(async move {
                 println!("Subscribing to {}", topic_for_sub);
                 let subscriber = session_sub
@@ -180,6 +185,7 @@ where
                     .unwrap();
                 while let Ok(sample) = subscriber.recv_async().await {
                     let payload = sample.payload().to_bytes().to_vec();
+                    stats_sub.record_received(payload.len());  // TRACK RECEIVED
                     let _ = actor_ref.tell(DocumentMessage::ApplyUpdate(payload)).await;
                 }
             });
@@ -190,6 +196,8 @@ where
             tag: args.origin,
             _subscription: subscription,
             fallback_state: args.initial_state,
+            _stats: args.stats,
+            _last_sync_state: last_sync,
             _marker: PhantomData,
         };
 

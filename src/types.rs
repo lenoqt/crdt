@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 
 #[derive(Debug)]
 pub enum CrdtError {
@@ -81,5 +84,44 @@ impl RobotPosition {
     }
     pub fn add_y(&mut self, value: f32) {
         self.y += value;
+    }
+}
+
+
+#[derive(Clone, Debug)]
+pub struct NetworkStats {
+    bytes_sent: Arc<AtomicU64>,
+    bytes_received: Arc<AtomicU64>,
+    messages_sent: Arc<AtomicU64>,
+    messages_received: Arc<AtomicU64>,
+}
+
+impl NetworkStats {
+    pub fn new() -> Self {
+        Self {
+            bytes_sent: Arc::new(AtomicU64::new(0)),
+            bytes_received: Arc::new(AtomicU64::new(0)),
+            messages_sent: Arc::new(AtomicU64::new(0)),
+            messages_received: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn record_sent(&self, bytes: usize) {
+        self.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.messages_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_received(&self, bytes: usize) {
+        self.bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.messages_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn get_stats(&self) -> (u64, u64, u64, u64) {
+        (
+            self.bytes_sent.load(Ordering::Relaxed),
+            self.bytes_received.load(Ordering::Relaxed),
+            self.messages_sent.load(Ordering::Relaxed),
+            self.messages_received.load(Ordering::Relaxed),
+        )
     }
 }
