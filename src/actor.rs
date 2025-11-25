@@ -10,7 +10,7 @@ use yrs::{
 };
 use zenoh::Session;
 
-use crate::types::RobotId;
+use crate::types::{CrdtError, RobotId};
 
 #[derive(Clone)]
 pub enum DocumentTag {
@@ -39,8 +39,8 @@ impl<T> Document<T>
 where
     T: Serialize + DeserializeOwned + Default + Send + Clone,
 {
-    fn set(&self, value: &T, origin: &yrs::Origin) {
-        let bytes = serde_json::to_vec(value).unwrap();
+    fn set(&self, value: &T, origin: &yrs::Origin) -> Result<(), CrdtError> {
+        let bytes = serde_json::to_vec(value)?;
         let mut txn = self.doc.transact_mut_with(origin.clone());
         let array = txn.get_or_insert_array("state");
 
@@ -49,6 +49,7 @@ where
             array.remove_range(&mut txn, 0, len);
         }
         array.push_back(&mut txn, bytes);
+        Ok(())
     }
 
     fn get(&self) -> T {
@@ -65,10 +66,11 @@ where
         self.fallback_state.clone().unwrap_or_default()
     }
 
-    fn apply_update(&self, update_bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    fn apply_update(&self, update_bytes: &[u8]) -> Result<(), CrdtError> {
         let mut txn = self.doc.transact_mut();
-        let update = Update::decode_v1(update_bytes)?;
-        txn.apply_update(update)?;
+        let update = Update::decode_v1(update_bytes).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+        txn.apply_update(update)
+            .map_err(|e| CrdtError::Yrs(e.to_string()))?;
         Ok(())
     }
 }
@@ -80,10 +82,11 @@ pub enum DocumentMessage<T> {
 }
 
 #[derive(Reply, Debug)]
+#[allow(dead_code)]
 pub enum DocumentReply<T: Send + 'static> {
-    Set(()),
+    Set(Result<(), CrdtError>),
     Get(T),
-    ApplyUpdate,
+    ApplyUpdate(Result<(), CrdtError>),
 }
 
 impl<T> DocumentReply<T>
@@ -113,15 +116,16 @@ where
     ) -> Self::Reply {
         match msg {
             DocumentMessage::Set(value) => {
-                self.set(&value, self.tag.as_origin());
-                DocumentReply::Set(())
+                let res = self.set(&value, self.tag.as_origin());
+                DocumentReply::Set(res)
             }
             DocumentMessage::Get => DocumentReply::Get(self.get()),
             DocumentMessage::ApplyUpdate(update) => {
-                if let Err(e) = self.apply_update(&update) {
+                let res = self.apply_update(&update);
+                if let Err(e) = &res {
                     eprintln!("Failed to apply update: {}", e);
                 }
-                DocumentReply::ApplyUpdate
+                DocumentReply::ApplyUpdate(res)
             }
         }
     }
