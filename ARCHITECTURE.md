@@ -23,14 +23,13 @@ Conflict-free Replicated Data Types (CRDTs) are the foundation of the synchroniz
 *   **`RobotPosition` struct:** The state of each robot (its ID and x/y coordinates) is stored in a `RobotPosition` struct. This struct is serialized to JSON and stored in a `yrs::Array` within a `yrs::Doc`.
 *   **State Synchronization:** `yrs` handles the merging of updates from different peers, ensuring that the state of the document converges to the same value across all instances, even when changes are made concurrently.
 
-### `zenoh` (Networking)
+### `Kameo Remote` (Networking)
 
-The `zenoh` framework is used as a decentralized, peer-to-peer pub/sub communication layer. It allows the different instances of the application to broadcast and receive updates without a central message broker.
+The application uses Kameo's built-in remote actor capabilities for networking and peer discovery. This provides a decentralized way for actors to communicate across different nodes.
 
-*   **Topic Structure:** The application uses a structured topic semantic for communication: `robot_id/position/sync`. For example, updates for robot 1 are published to the topic `1/position/sync`.
-*   **Publish-Subscribe Model:**
-    *   **Publishing:** An actor representing an "owned" robot (one controlled by the local user) publishes updates to its corresponding topic whenever its state changes.
-    *   **Subscribing:** An actor representing a "remote" robot subscribes to the corresponding topic to receive updates from the peer controlling that robot.
+*   **Discovery:** The `DocumentRegistry` uses Kameo's DHT-based discovery mechanism (`RemoteActorRef::lookup_all`) to find other `Document` actors on the network registered with the name "crdt_document".
+*   **Messaging:** Updates are broadcasted by sending `DocumentMessage::ApplyUpdate` messages directly to known remote actor references.
+*   **Remote Messages:** The `DocumentMessage` enum is annotated with `#[remote_message]` to ensure proper serialization and routing between nodes.
 
 ### `crossterm` and `clap` (CLI)
 
@@ -42,51 +41,58 @@ These libraries are used to create the command-line user interface.
 ## 3. Application Flow
 
 1.  **Startup:** The application is started with an ID (1 or 2), e.g., `crdt --id 1`.
-2.  **Actor Creation:** The `main` function creates two `Document` actors:
-    *   An **"owned" actor** for the robot corresponding to the provided ID. This actor is configured to publish updates.
-    *   A **"remote" actor** for the other robot. This actor is configured to subscribe to updates.
-3.  **User Input:** The application listens for keyboard input. When an arrow key is pressed, it sends a message to the `owned_actor` to update its position.
-4.  **Update Publication:** The `owned_actor` updates its local CRDT document. This triggers an observer that encodes the changes into an update payload and publishes it to the corresponding `zenoh` topic (e.g., `1/position/sync`).
-5.  **Update Reception:** On the other peer's machine, the `remote_actor` (which is subscribed to that topic) receives the update payload.
-6.  **State Convergence:** The `remote_actor` applies the update to its local CRDT document, causing the position of the remote robot to be updated on the screen.
+2.  **Bootstrap:** Kameo's remote system is bootstrapped to join the distributed network.
+3.  **Actor Creation:** The `DocumentRegistry` creates an **"owned" actor** for the local robot and registers it with the name "crdt_document".
+4.  **Discovery:** A background task in `DocumentRegistry` continuously looks up other actors named "crdt_document". When a new peer is found, it is added to the registry.
+5.  **User Input:** The application listens for keyboard input. When an arrow key is pressed, it sends a message to the `owned_actor` to update its position.
+6.  **Update Propagation:**
+    *   The `owned_actor` updates its local CRDT document.
+    *   An observer triggers and encodes the update.
+    *   The `DocumentRegistry` broadcasts this update to all known remote peers by sending `DocumentMessage::ApplyUpdate`.
+7.  **Update Reception:** Remote actors receive the `ApplyUpdate` message.
+8.  **State Convergence:** The remote actor applies the update to its local CRDT document, ensuring all peers see the same state.
 
 ## 4. Data Flow Diagram
 
 Here is a simplified data flow diagram for a scenario where User 1 (with `--id 1`) moves their robot:
 
 ```
-+----------------+      +----------------+      +----------------+
-| User 1         |      | User 2         |      | User 3         |
-| (Instance --id 1)|      | (Instance --id 2)|      | (Instance --id 1)|
-+----------------+      +----------------+      +----------------+
-       |                        |                        |
-       | 1. Moves Robot 1       |                        |
-       v                        |                        |
-+----------------+              |                        |
-| Owned Actor 1  |              |                        |
-| (Instance 1)   |              |                        |
-+----------------+              |                        |
-       |                        |                        |
-       | 2. Publishes to topic  |                        |
-       |    '1/position/sync'   |                        |
-       v                        v                        v
++----------------+      +----------------+
+| User 1         |      | User 2         |
+| (Instance --id 1)|      | (Instance --id 2)|
++----------------+      +----------------+
+       |                        |
+       | 1. Moves Robot 1       |
+       v                        |
++----------------+              |
+| Owned Actor 1  |              |
+| (Instance 1)   |              |
++----------------+              |
+       |                        |
+       | 2. Update Observer     |
+       v                        |
++----------------+              |
+| DocumentRegistry|             |
+| (Instance 1)   |              |
++----------------+              |
+       |                        |
+       | 3. Broadcasts Update   |
+       |    via Kameo Remote    |
+       v                        v
 +-------------------------------------------------------------+
-| zenoh network                                               |
+| Kameo Distributed Network (DHT / P2P)                       |
 +-------------------------------------------------------------+
-       |                        |                        |
-       |                        | 3. Receives update     | 3. Receives update
-       |                        v                        v
-       |                +----------------+      +----------------+
-       |                | Remote Actor 1 |      | Remote Actor 1 |
-       |                | (Instance 2)   |      | (Instance 3)   |
-       |                +----------------+      +----------------+
-       |                        |                        |
-       |                        | 4. Updates local state | 4. Updates local state
-       |                        v                        v
-       |                (Screen updates)          (Screen updates)
-       |
-       | (No subscription for owned document, no local update from network)
-       |
+       |                        |
+       |                        | 4. Receives ApplyUpdate msg
+       |                        v
+       |                +----------------+
+       |                | Remote Actor 1 |
+       |                | (Instance 2)   |
+       |                +----------------+
+       |                        |
+       |                        | 5. Updates local state
+       |                        v
+       |                (Screen updates)
 ```
 
 This architecture creates a robust and decentralized system for real-time collaboration, where each peer is responsible for its own state and communicates directly with others.
