@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 use yrs::updates::decoder::Decode;
-use yrs::updates::encoder::Encode;
 use yrs::{Doc, Map, Origin, ReadTxn, Subscription, Transact, Update, WriteTxn};
 
 use crate::types::CrdtError as CRDTError;
@@ -54,14 +52,7 @@ pub struct RelayInfo {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GetRelayInfo;
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SyncStep1(pub Vec<u8>);
-
-#[derive(Clone, Serialize, Deserialize, Reply)]
-pub struct SyncStep2(pub Vec<u8>);
-
-// Internal message for handling sync locally
-pub struct LocalSyncStep1(pub Vec<u8>, pub oneshot::Sender<SyncStep2>);
+// Internal message for handling sync locally - REMOVED
 
 // --- Document Actor ---
 
@@ -160,17 +151,9 @@ where
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let recipient_update = actor_ref.clone().recipient::<DocumentUpdate>();
-        let recipient_sync = actor_ref.clone().recipient::<LocalSyncStep1>();
         let document = Doc::new();
 
-        let relay = match DocumentRelay::initialize(
-            args.id,
-            Self::name(),
-            recipient_update,
-            recipient_sync,
-        )
-        .await
-        {
+        let relay = match DocumentRelay::initialize(args.id, Self::name(), recipient_update).await {
             Ok(relay) => relay,
             Err(e) => {
                 println!("Failed to initialize relay: {}", e);
@@ -179,40 +162,6 @@ where
         };
 
         // Start periodic sync
-        let relay_clone = relay.clone();
-        let doc_clone = document.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-            loop {
-                interval.tick().await;
-                let sv = doc_clone.transact().state_vector().encode_v1();
-                match relay_clone.ask(GetRemotes).await {
-                    Ok(remotes) => {
-                        for remote in remotes.0.iter() {
-                            let msg = SyncStep1(sv.clone());
-                            // Ask remote for diff
-                            match remote.ask(&msg).await {
-                                Ok(diff) => {
-                                    // Apply diff
-                                    if !diff.0.is_empty() {
-                                        println!("Applied sync diff of size: {}", diff.0.len());
-                                        let mut txn = doc_clone.transact_mut_with("sync");
-                                        if let Ok(update) = Update::decode_v1(&diff.0) {
-                                            if let Err(e) = txn.apply_update(update) {
-                                                println!("Failed to apply sync update: {}", e);
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => println!("Sync request failed: {}", e),
-                            }
-                        }
-                    }
-                    Err(e) => println!("Sync loop failed to get remotes: {}", e),
-                }
-            }
-        });
 
         let relay_subscription = relay.clone();
         let subscription = document
@@ -256,27 +205,6 @@ where
             .expect("subscription error handled above");
 
         Ok(Self::new(document, subscription, relay))
-    }
-}
-
-impl<T> Message<LocalSyncStep1> for Document<T>
-where
-    T: Send + Sync + Serialize + DeserializeOwned + 'static,
-{
-    type Reply = (); // We reply via oneshot
-
-    async fn handle(&mut self, msg: LocalSyncStep1, _: &mut Context<Self, Self::Reply>) {
-        match yrs::StateVector::decode_v1(&msg.0) {
-            Ok(sv) => {
-                let txn = self.document.transact();
-                let diff = txn.encode_state_as_update_v1(&sv);
-                let _ = msg.1.send(SyncStep2(diff));
-            }
-            Err(e) => {
-                println!("Failed to decode SV in sync request: {}", e);
-                let _ = msg.1.send(SyncStep2(vec![]));
-            }
-        }
     }
 }
 
@@ -349,22 +277,15 @@ pub struct DocumentRelay {
     pub(crate) name: String,
     pub(crate) remotes: Arc<Vec<RemoteActorRef<DocumentRelay>>>,
     pub(crate) local_update: Recipient<DocumentUpdate>,
-    pub(crate) local_sync: Recipient<LocalSyncStep1>,
 }
 
 impl DocumentRelay {
-    fn new(
-        id: String,
-        name: String,
-        local_update: Recipient<DocumentUpdate>,
-        local_sync: Recipient<LocalSyncStep1>,
-    ) -> Self {
+    fn new(id: String, name: String, local_update: Recipient<DocumentUpdate>) -> Self {
         Self {
             id,
             name,
             remotes: Arc::new(Vec::new()),
             local_update,
-            local_sync,
         }
     }
 
@@ -372,9 +293,8 @@ impl DocumentRelay {
         id: String,
         name: &str,
         local_update: Recipient<DocumentUpdate>,
-        local_sync: Recipient<LocalSyncStep1>,
     ) -> Result<ActorRef<Self>, CRDTError> {
-        let actor = DocumentRelay::new(id, name.to_string(), local_update, local_sync);
+        let actor = DocumentRelay::new(id, name.to_string(), local_update);
         let actor_ref = DocumentRelay::spawn(actor);
 
         actor_ref.register(name).await.map_err(|e| {
@@ -458,29 +378,6 @@ impl DocumentRelay {
                 }
             }
         });
-    }
-}
-
-#[kameo::remote_message("sync_step_1")]
-impl Message<SyncStep1> for DocumentRelay {
-    type Reply = SyncStep2;
-
-    async fn handle(&mut self, msg: SyncStep1, _: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        let (tx, rx) = oneshot::channel();
-        let local_msg = LocalSyncStep1(msg.0, tx);
-
-        if let Err(e) = self.local_sync.tell(local_msg).send().await {
-            println!("Failed to forward SyncStep1 to local document: {}", e);
-            return SyncStep2(vec![]);
-        }
-
-        match rx.await {
-            Ok(resp) => resp,
-            Err(e) => {
-                println!("Failed to receive sync response from local document: {}", e);
-                SyncStep2(vec![])
-            }
-        }
     }
 }
 

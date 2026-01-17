@@ -2,7 +2,7 @@ use clap::Parser;
 use crdt::actor::{Document, DocumentContext, GetAllData, SetData};
 use crdt::types::{ChatMessage, RobotId};
 use kameo::actor::Spawn;
-use kameo::prelude::*;
+
 use std::io::{self, Write};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -36,6 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         id: args.id.to_string(),
     };
     let chat_actor = Document::<ChatMessage>::spawn(context);
+
+    // Wait for peer discovery
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     // Initial message
     let key = format!(
